@@ -1,0 +1,133 @@
+name: Sync Weekend Market Gaps Dataset
+
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-dataset
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch and validate dataset snapshots
+        run: |
+          python3 - <<'PY'
+          import csv
+          import io
+          import json
+          import pathlib
+          import urllib.request
+
+          USER_AGENT = "weekend-market-gaps-data-sync"
+          CSV_URL = "https://weekendmarkets.site/api/history.csv"
+          JSON_URL = "https://weekendmarkets.site/api/history.v1.json"
+
+          EXPECTED_FIELDS = [
+              "asset",
+              "weekend",
+              "lastClose",
+              "preReopenPrice",
+              "reopenPrice",
+              "cashOpen",
+              "weekendMovePct",
+              "reopenGapPct",
+              "sameDirection",
+          ]
+
+          def fetch_text(url: str) -> str:
+              req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  if resp.status != 200:
+                      raise RuntimeError(f"Unexpected HTTP {resp.status} for {url}")
+                  return resp.read().decode("utf-8")
+
+          csv_raw = fetch_text(CSV_URL)
+          json_raw = fetch_text(JSON_URL)
+
+          # Validate CSV
+          csv_norm = csv_raw.replace("\r\n", "\n").rstrip("\n") + "\n"
+          rows = list(csv.reader(io.StringIO(csv_norm)))
+          if len(rows) <= 11:
+              raise RuntimeError(f"CSV has too few lines: {len(rows)}")
+          header = rows[0]
+          if header != EXPECTED_FIELDS:
+              raise RuntimeError(f"Unexpected CSV header: {header}")
+          csv_data_rows = len(rows) - 1
+
+          # Validate JSON
+          payload = json.loads(json_raw)
+          if not isinstance(payload, dict):
+              raise RuntimeError("JSON payload must be an object")
+          records = payload.get("records")
+          if not isinstance(records, list) or len(records) <= 10:
+              raise RuntimeError("JSON records missing or too few")
+          if payload.get("count") != len(records):
+              raise RuntimeError(
+                  f"JSON count mismatch: count={payload.get('count')} vs records={len(records)}"
+              )
+          if len(records) != csv_data_rows:
+              raise RuntimeError(
+                  f"CSV/JSON row count mismatch: csv={csv_data_rows} vs json={len(records)}"
+              )
+          required_set = set(EXPECTED_FIELDS)
+          for idx, rec in enumerate(records):
+              if not isinstance(rec, dict) or not required_set.issubset(rec.keys()):
+                  raise RuntimeError(f"Invalid record at index {idx}")
+
+          data_dir = pathlib.Path("data")
+          data_dir.mkdir(parents=True, exist_ok=True)
+          csv_path = data_dir / "history.csv"
+          json_path = data_dir / "history.v1.json"
+
+          # Write CSV
+          csv_changed = (not csv_path.exists()) or (csv_path.read_text(encoding="utf-8") != csv_norm)
+          csv_path.write_text(csv_norm, encoding="utf-8")
+
+          # Compare JSON ignoring volatile generated_at timestamp so we only commit real data changes
+          def strip_volatile(obj: dict) -> dict:
+              return {k: v for k, v in obj.items() if k != "generated_at"}
+
+          json_changed = True
+          if json_path.exists():
+              try:
+                  existing = json.loads(json_path.read_text(encoding="utf-8"))
+                  if isinstance(existing, dict) and strip_volatile(existing) == strip_volatile(payload):
+                      json_changed = False
+              except Exception:
+                  json_changed = True
+
+          if json_changed or csv_changed:
+              formatted = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+              json_path.write_text(formatted, encoding="utf-8")
+
+          assets = len(set(r["asset"] for r in records))
+          weekends = sorted(set(r["weekend"] for r in records))
+          print(
+              f"Validated {len(records)} records across {assets} assets and "
+              f"{len(weekends)} weekends ({weekends[0]}..{weekends[-1]}). "
+              f"csv_changed={csv_changed}, json_changed={json_changed}"
+          )
+          PY
+
+      - name: Commit and push if dataset changed
+        run: |
+          if git diff --quiet -- data/; then
+            echo "No dataset changes detected."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/history.csv data/history.v1.json
+          git commit -m "chore(data): sync weekend gap history ($(date -u +%Y-%m-%d))"
+          git push
